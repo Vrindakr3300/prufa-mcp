@@ -26,7 +26,10 @@ OSS_TOOLS: list[Tool] = [
         description=(
             "Run a public-page QA audit on a URL. Returns findings JSON: "
             "tracking pixels, broken flows, consent violations, console errors, "
-            "compliance signals. Rate-limited; one call returns one audit."
+            "compliance signals. Rate-limited; one call returns one audit. "
+            "When wait=true (default), blocks until the audit completes and "
+            "returns the JSON report. When wait=false, returns immediately with "
+            "status='queued' and the run_id + share_token so you can poll later."
         ),
         inputSchema={
             "type": "object",
@@ -47,15 +50,23 @@ OSS_TOOLS: list[Tool] = [
     Tool(
         name="prufa_get_report",
         description=(
-            "Fetch a shareable report for a completed audit. Returns the report URL "
-            "and a summary of findings. Rate-limited."
+            "Fetch a shareable report for a completed audit. Returns the JSON "
+            "report payload (findings, status, url). The `report_id` argument "
+            "accepts EITHER the internal run UUID (8-4-4-4-12 hex) OR the "
+            "public share_token slug (the value after /r/ in report_url). "
+            "The share_token is what you see in the audit creation response "
+            "and is the recommended call shape."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "report_id": {
                     "type": "string",
-                    "description": "The report ID returned by prufa_run_audit.",
+                    "description": (
+                        "Either the run UUID (8-4-4-4-12 hex) OR the share_token "
+                        "slug (the value after /r/ in report_url). The slug is "
+                        "preferred — it's what the audit creation response returns."
+                    ),
                 },
             },
             "required": ["report_id"],

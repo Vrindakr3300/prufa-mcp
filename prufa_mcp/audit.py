@@ -4,54 +4,212 @@ The OSS MCP server is a thin client. Real audit execution, deterministic
 checks (BeaconEvent analyzers, consent rules), Playwright orchestration,
 and the human-readable report live in the hosted product. This file
 proxies audit-trigger and report-fetch calls to that hosted API.
+
+The audit API is asynchronous: POST /api/v1/audits always returns 202
+with status "queued". To honor `wait=True`, this client polls the run
+status endpoint until the audit reaches a terminal state, then fetches
+the report. The shared public-by-token endpoint (`/api/v1/reports/by-
+token/{share_token}`) is the canonical way to read the report when only
+the public slug is known — matching the slug the agent sees in the
+audit creation response (`report_url: /r/<slug>`).
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import re
+import uuid
 from typing import Any
 
 import httpx
 
 
 PRUFA_API_BASE = os.environ.get("PRUFA_API_BASE", "https://app.prufa.dev")
-PRUFA_API_TOKEN = os.environ.get("PRUFA_API_TOKEN", "")
+
+
+def _api_token() -> str:
+    """Read the API token fresh on every call.
+
+    Module-level capture (the v0.1.0 pattern) breaks tests that set
+    the env var after import — and forces a process restart for any
+    token rotation. Reading it per-call is also how the monorepo MCP
+    server does it.
+    """
+    return os.environ.get("PRUFA_API_TOKEN", "")
+
+# The audit API takes ~25-60s for typical sites; cap polling at 90s
+# to match the monorepo MCP server's behavior.
+_POLL_INTERVAL_S = 3.0
+_POLL_MAX_ITERS = 30
+_UUID_LIKE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _share_token_from_report_url(report_url: str | None) -> str | None:
+    """Extract the share_token slug from a /r/<token> URL.
+
+    Same helper as the monorepo MCP server — duplicated here so the
+    OSS package is self-contained.
+    """
+    if not report_url or "/r/" not in report_url:
+        return None
+    tail = report_url.split("/r/", 1)[-1]
+    return tail.split("/")[0].split("?")[0] or None
 
 
 async def run_audit(*, url: str, wait: bool = True) -> dict[str, Any]:
-    """Trigger a public-page audit on a URL."""
-    if not PRUFA_API_TOKEN:
+    """Trigger a public-page audit on a URL.
+
+    When `wait` is True (default), blocks until the audit reaches a
+    terminal state and returns the JSON report. When False, returns
+    immediately with the queued state — caller polls via `get_report`.
+    """
+    if not _api_token():
         return {
             "error": "missing_token",
             "hint": "Set PRUFA_API_TOKEN to a Prufa API key. Run `prufa-mcp setup` for a guided flow.",
             "docs": "https://prufa.dev/docs/mcp",
         }
 
-    headers = {"Authorization": f"Bearer {PRUFA_API_TOKEN}", "Idempotency-Key": f"mcp-{url}"}
-    timeout = 120.0 if wait else 10.0
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
+    headers = {"Authorization": f"Bearer {_api_token()}", "Idempotency-Key": f"mcp-{url}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # The API ignores `wait` on creation — it always returns 202 queued.
+        create = await client.post(
             f"{PRUFA_API_BASE}/api/v1/audits",
-            json={"url": url, "wait": wait},
+            json={"url": url},
             headers=headers,
         )
-        response.raise_for_status()
-        return response.json()
+        create.raise_for_status()
+        created = create.json()
+
+    run_id = created.get("run_id")
+    report_url = created.get("report_url")
+    share_token = _share_token_from_report_url(report_url)
+    base: dict[str, Any] = {
+        "run_id": run_id,
+        "status": created.get("status"),
+        "report_url": report_url,
+    }
+    if share_token:
+        base["share_token"] = share_token
+
+    if not wait or not run_id:
+        return base
+
+    # Poll the run until terminal, then fetch the report via the
+    # by-token endpoint (public, no auth quirks).
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _ in range(_POLL_MAX_ITERS):
+            await asyncio.sleep(_POLL_INTERVAL_S)
+            try:
+                run_resp = await client.get(
+                    f"{PRUFA_API_BASE}/api/v1/audits/{run_id}",
+                    headers={"Authorization": f"Bearer {_api_token()}"},
+                )
+            except httpx.HTTPError:
+                continue
+            if run_resp.status_code != 200:
+                continue
+            run = run_resp.json()
+            if run.get("status") in {"succeeded", "failed", "blocked", "timeout"}:
+                if share_token:
+                    rep_resp = await client.get(
+                        f"{PRUFA_API_BASE}/api/v1/reports/by-token/{share_token}",
+                        headers={"Authorization": f"Bearer {_api_token()}"},
+                    )
+                else:
+                    rep_resp = await client.get(
+                        f"{PRUFA_API_BASE}/api/v1/audits/{run_id}/report.json",
+                        headers={"Authorization": f"Bearer {_api_token()}"},
+                    )
+                if rep_resp.status_code == 200:
+                    report = rep_resp.json()
+                    if isinstance(report, dict):
+                        report.setdefault("run_id", run_id)
+                        report.setdefault("report_url", report_url)
+                        if share_token:
+                            report.setdefault("share_token", share_token)
+                    return report
+                # Report not ready yet — return a status object so the
+                # agent has the identifiers and can poll manually.
+                return {
+                    "run_id": run_id,
+                    "status": run.get("status"),
+                    "report_url": report_url,
+                    "share_token": share_token,
+                    "failure_reason": run.get("failure_reason"),
+                    "report_not_ready": True,
+                }
+    # Timeout — return base info so the agent can poll manually.
+    return {
+        "run_id": run_id,
+        "status": "timeout",
+        "report_url": report_url,
+        "share_token": share_token,
+        "hint": "audit did not complete within 90s; poll with get_report(report_id=share_token)",
+    }
 
 
 async def get_report(*, report_id: str) -> dict[str, Any]:
-    """Fetch a shareable report for a completed audit."""
-    if not PRUFA_API_TOKEN:
+    """Fetch a shareable report.
+
+    `report_id` may be either the internal run UUID or the public
+    share_token slug (from /r/<token>). The slug is what the agent
+    sees in the audit creation response — it's the recommended call
+    shape. UUIDs (8-4-4-4-12 hex) are routed to the legacy auth
+    endpoint; everything else is treated as a share_token.
+    """
+    if not _api_token():
         return {
             "error": "missing_token",
             "hint": "Set PRUFA_API_TOKEN to a Prufa API key.",
             "docs": "https://prufa.dev/docs/mcp",
         }
 
-    headers = {"Authorization": f"Bearer {PRUFA_API_TOKEN}"}
+    if not report_id:
+        return {"error": "invalid_arguments", "hint": "report_id is required"}
+
+    headers = {"Authorization": f"Bearer {_api_token()}"}
+
+    # Validate-or-route: real UUIDs hit the legacy /audits/{uuid}/report.json
+    # endpoint; everything else is a share_token and hits the by-token
+    # endpoint. We validate the UUID format rather than catching errors
+    # so the agent gets a clear 404 (not a 422 schema error).
+    is_uuid = bool(_UUID_LIKE.match(report_id)) or _looks_like_uuid(report_id)
+    if is_uuid:
+        path = f"/api/v1/audits/{report_id}/report.json"
+    else:
+        path = f"/api/v1/reports/by-token/{report_id}"
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            f"{PRUFA_API_BASE}/api/v1/reports/{report_id}",
-            headers=headers,
-        )
-        response.raise_for_status()
+        try:
+            response = await client.get(f"{PRUFA_API_BASE}{path}", headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # 404 on the UUID endpoint means "no run with that UUID";
+            # 404 on the by-token endpoint means "no run with that
+            # share_token". Surface the original status so the agent
+            # can tell which identifier was wrong.
+            return {
+                "error": "not_found",
+                "hint": (
+                    f"no report found for {report_id!r} "
+                    f"(path: {path}). Pass the share_token from the "
+                    "audit creation response (the slug after /r/ in report_url), "
+                    "or the run_id UUID."
+                ),
+                "http_status": exc.response.status_code,
+            }
         return response.json()
+
+
+def _looks_like_uuid(s: str) -> bool:
+    """Best-effort UUID detection for values that don't pass the strict
+    8-4-4-4-12 regex (e.g. ULID-style ids the API has historically emitted)."""
+    try:
+        uuid.UUID(s)
+        return True
+    except (ValueError, AttributeError):
+        return False
