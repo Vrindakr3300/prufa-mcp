@@ -11,24 +11,72 @@ before the 5-hour window opens.
 
 ![Prufa running on a vibe-coded Next.js app](assets/demo.gif)
 
-> The demo GIF will land in v0.2. Until then, see "What you get" below for
-> the live call shape, and `examples/` for runnable scripts.
+> The demo GIF will land in a future release. Until then, see "What you get" below
+> for the live call shape, and `examples/` for runnable scripts.
 
-## Quickstart
+## Install
+
+The package is on [PyPI](https://pypi.org/project/prufa-mcp/) (v0.1.3). Install it
+globally with `pipx` (recommended — installs into an isolated venv and exposes
+the `prufa-mcp` binary on your PATH) or into a project venv with `pip`:
 
 ```bash
+# Recommended — global install, isolated venv
+pipx install prufa-mcp
+
+# Or, into your project venv
 pip install prufa-mcp
-# or
-npm install -g prufa-mcp  # (npm mirror — not yet published, see Task 1.11)
+
+# Verify the binary is on PATH
+which prufa-mcp
+# Should print something like: /Users/you/.local/bin/prufa-mcp
 ```
 
-Then in your `.mcp.json` (Claude Code, Cursor, Cline, Continue, etc.):
+You also need a free Prufa API key. The first audit is free, no card required.
+
+1. Sign in at [prufa.dev](https://prufa.dev) (Google OAuth)
+2. Create an API key from the dashboard — or via the CLI: `prufa keys mint "<name>"`
+
+## Wire into your agent
+
+The MCP server runs as a stdio subprocess, spawned by your agent on first use.
+The cleanest way to register it is `claude mcp add` (Claude Code's built-in
+command — it writes the config to `~/.claude.json` correctly, which the
+`~/.claude/mcp.json` path does NOT).
+
+### Claude Code (recommended path)
+
+```bash
+# Get the absolute path of the binary (use whatever `which prufa-mcp` returned)
+PRUFA_BIN=$(which prufa-mcp)
+
+# Add the MCP server. The token stays out of your shell history.
+read -s -p "Prufa API token: " PRUFA_TOKEN && echo
+claude mcp add \
+  --scope user \
+  --env "PRUFA_API_TOKEN=$PRUFA_TOKEN" \
+  prufa \
+  -- "$PRUFA_BIN"
+```
+
+Restart Claude Code (config is read at startup), then verify:
+
+```
+/mcp
+```
+
+You should see `prufa` listed as **Connected**, with `prufa_run_audit` and
+`prufa_get_report` as available tools.
+
+### Cursor / Cline / Continue (hand-edit `.mcp.json`)
+
+In your project root or in `~/.config/Claude/` etc.:
 
 ```json
 {
   "mcpServers": {
     "prufa": {
-      "command": "prufa-mcp",
+      "command": "/Users/you/.local/bin/prufa-mcp",
       "env": {
         "PRUFA_API_TOKEN": "your-prufa-api-key"
       }
@@ -37,40 +85,48 @@ Then in your `.mcp.json` (Claude Code, Cursor, Cline, Continue, etc.):
 }
 ```
 
-Get a free API key at [prufa.dev](https://prufa.dev) — the first audit is free, no card required.
+Restart the host app. The command path must be the absolute binary path
+(not `~`, not `$()`) — those don't expand in MCP config.
 
-Then in your agent:
+## Use it
+
+In your agent:
 
 ```
-> audit https://my-vibe-coded-app.com
-> run prufa on my staging deploy and show me the criticals
-> check my landing page for broken tracking pixels
+> audit https://my-vibe-coded-app.com and show me the criticals
+> run prufa on my staging deploy
+> fetch the report for the audit I just ran
 ```
+
+`prufa_run_audit` with `wait=true` (the default) **blocks** until the audit
+completes and returns the JSON report directly — typically 25–60s for a public
+page. If you set `wait=false`, the call returns immediately with the queued
+state plus a `share_token` you can poll with `prufa_get_report`.
 
 ## What you get (the OSS surface)
 
 | Tool | What it does |
 |---|---|
-| `prufa_run_audit` | One call → runs a public-page audit, returns findings JSON |
-| `prufa_get_report` | Fetches a shareable report for a completed audit |
+| `prufa_run_audit(url, wait=true)` | Triggers a public-page audit, polls until done, returns findings JSON. The `wait` flag is honored — it actually blocks. |
+| `prufa_get_report(report_id)` | Fetches a report. `report_id` is EITHER the run UUID (from `prufa_run_audit`'s `run_id` field) OR the `share_token` (the slug from `/r/<token>` in the audit creation `report_url`). The slug is what you'll see most often — use that. |
 
-That's it. The audit primitive is small. The hosted product at
-[prufa.dev](https://prufa.dev) is where the value compounds — scheduling,
-alerting, team workflows, and the human-readable HTML report.
-
-## Why open source
-
-Same shape as [Stagehand](https://github.com/browserbase/stagehand) (free) →
-[Browserbase](https://www.browserbase.com) (paid). Open the primitive. The
-hosted tier earns the right to be paid by being the thing that scales.
+The other ~13 tools (workspace setup, flows, monitors, alerts, billing) live in
+the hosted product at [prufa.dev](https://prufa.dev).
 
 ## Examples
 
-- `examples/nextjs-app/` — audit a deployed Next.js app
-- `examples/vite-spa/` — audit a Vite SPA
-- `examples/stripe-checkout/` — audit a Stripe-checkout page (focuses on payment-flow verification)
+Three runnable scripts in `examples/`:
 
-Each example is a copy-pasteable demo. Clone, set `PRUFA_API_TOKEN`, run.
+- `examples/nextjs-app/` — audit a deployed Next.js app
+- `examples/vite-spa/` — audit a Vite SPA (focuses on client-side routing audits)
+- `examples/stripe-checkout/` — audit a Stripe-checkout page (payment-flow verification)
+
+Each is a copy-pasteable demo:
+
+```bash
+export PRUFA_API_TOKEN=...
+python examples/nextjs-app/audit.py https://your-nextjs-app.com
+```
 
 ## GitHub Action
 
@@ -109,9 +165,14 @@ See `examples/prufa-scan.yml` for the full template.
 
 ## SLO
 
-The hosted audit API targets a 30-second p95 for `wait=true` on public pages.
-The OSS server is a thin client — it does no audit work itself, so its only
-SLO is "responds to MCP `list_tools` and `call_tool` within 1 second."
+- **Hosted audit API:** 30-second p95 for `wait=true` on public pages.
+- **OSS MCP server:** thin client — its only SLO is "responds to MCP `list_tools` and `call_tool` within 1 second" (the heavy work happens server-side).
+
+## Versioning
+
+Published via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) from
+the GitHub Action on every `v*` tag. Install a specific version with
+`pipx install prufa-mcp==0.1.3` or `pip install prufa-mcp==0.1.3`.
 
 ## License
 
