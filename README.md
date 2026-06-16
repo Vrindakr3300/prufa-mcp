@@ -9,10 +9,7 @@ before the 5-hour window opens.
 
 ## 30-second demo
 
-![Prufa running on a vibe-coded Next.js app](assets/demo.gif)
-
-> The demo GIF will land in a future release. Until then, see "What you get" below
-> for the live call shape, and `examples/` for runnable scripts.
+![Installing prufa-mcp and wiring it into Claude Code](assets/demo.gif)
 
 ## Install
 
