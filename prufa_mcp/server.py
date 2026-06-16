@@ -96,17 +96,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 
 def main() -> None:
-    import argparse
-    import sys
-    import asyncio
+    """Sync entrypoint for the console_scripts system.
 
+    Wraps :func:`_amain` in :func:`asyncio.run` so the `prufa-mcp` console
+    script (which doesn't await coroutines) works correctly.
+    """
     parser = argparse.ArgumentParser(description="Prufa MCP server (OSS)")
-    parser.add_argument("--version", action="store_true")
-
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the prufa-mcp version and exit",
+    )
     args, _ = parser.parse_known_args()
 
     if args.version:
-        print("0.1.3")
+        try:
+            from importlib.metadata import version
+
+            print(version("prufa-mcp"))
+        except Exception:
+            from prufa_mcp import __version__
+
+            print(__version__)
         sys.exit(0)
 
     asyncio.run(_amain())
